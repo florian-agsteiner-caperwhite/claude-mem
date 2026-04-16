@@ -18,6 +18,7 @@ import { ensureWorkerRunning, workerHttpRequest } from '../../shared/worker-util
 import { logger } from '../../utils/logger.js';
 import { extractLastMessage } from '../../shared/transcript-parser.js';
 import { HOOK_EXIT_CODES, HOOK_TIMEOUTS, getTimeout } from '../../shared/hook-constants.js';
+import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 
 const SUMMARIZE_TIMEOUT_MS = getTimeout(HOOK_TIMEOUTS.DEFAULT);
 const POLL_INTERVAL_MS = 500;
@@ -82,6 +83,13 @@ export const summarizeHandler: EventHandler = {
     }
 
     logger.debug('HOOK', 'Summary request queued, waiting for completion');
+
+    // When CLAUDE_MEM_ASYNC_SUMMARY=true, fire-and-forget: return immediately
+    // without polling so the Stop hook does not block the session exit.
+    if (SettingsDefaultsManager.getBool('CLAUDE_MEM_ASYNC_SUMMARY')) {
+      logger.info('HOOK', 'Async summary mode: returning immediately without polling', { sessionId });
+      return { continue: true, suppressOutput: true };
+    }
 
     // 2. Poll worker until pending work for this session is done.
     //    This keeps the Stop hook alive (120s timeout) so the SDK agent
