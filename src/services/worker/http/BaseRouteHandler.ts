@@ -1,22 +1,9 @@
-/**
- * BaseRouteHandler
- *
- * Base class for all route handlers providing:
- * - Automatic try-catch wrapping with error logging
- * - Integer parameter validation
- * - Required body parameter validation
- * - Standard HTTP response helpers
- * - Centralized error handling
- */
 
 import { Request, Response } from 'express';
 import { logger } from '../../../utils/logger.js';
 import { AppError } from '../../server/ErrorHandler.js';
 
 export abstract class BaseRouteHandler {
-  /**
-   * Wrap handler with automatic try-catch and error logging
-   */
   protected wrapHandler(
     handler: (req: Request, res: Response) => void | Promise<void>
   ): (req: Request, res: Response) => void {
@@ -27,18 +14,30 @@ export abstract class BaseRouteHandler {
           result.catch(error => this.handleError(res, error as Error));
         }
       } catch (error) {
-        logger.error('HTTP', 'Route handler error', { path: req.path }, error as Error);
-        this.handleError(res, error as Error);
+        const normalizedError = error instanceof Error ? error : new Error(String(error));
+        logger.error('HTTP', 'Route handler error', { path: req.path }, normalizedError);
+        this.handleError(res, normalizedError);
       }
     };
   }
 
   /**
-   * Parse and validate integer parameter
-   * Returns the integer value or sends 400 error response
+   * Coerce an Express route/query param to a single string.
+   *
+   * Express 5 types params and query values as `string | string[]` (repeated
+   * keys produce an array). This returns the first element of an array, the
+   * string as-is, or '' when the value is absent — giving callers a plain
+   * `string` to work with.
    */
+  protected toStringParam(value: string | string[] | undefined): string {
+    if (Array.isArray(value)) {
+      return value[0] ?? '';
+    }
+    return value ?? '';
+  }
+
   protected parseIntParam(req: Request, res: Response, paramName: string): number | null {
-    const value = parseInt(req.params[paramName], 10);
+    const value = parseInt(this.toStringParam(req.params[paramName]), 10);
     if (isNaN(value)) {
       this.badRequest(res, `Invalid ${paramName}`);
       return null;
@@ -46,41 +45,15 @@ export abstract class BaseRouteHandler {
     return value;
   }
 
-  /**
-   * Validate required body parameters
-   * Returns true if all required params present, sends 400 error otherwise
-   */
-  protected validateRequired(req: Request, res: Response, params: string[]): boolean {
-    for (const param of params) {
-      if (req.body[param] === undefined || req.body[param] === null) {
-        this.badRequest(res, `Missing ${param}`);
-        return false;
-      }
-    }
-    return true;
-  }
-
-  /**
-   * Send 400 Bad Request response
-   */
   protected badRequest(res: Response, message: string): void {
     res.status(400).json({ error: message });
   }
 
-  /**
-   * Send 404 Not Found response
-   */
   protected notFound(res: Response, message: string): void {
     res.status(404).json({ error: message });
   }
 
-  /**
-   * Centralized error logging and response
-   * Checks headersSent to avoid "Cannot set headers after they are sent" errors
-   */
   protected handleError(res: Response, error: Error, context?: string): void {
-    // [APPROVED OVERRIDE]: Worker routes need centralized AppError translation so
-    // status/code/details stay consistent across every HTTP handler.
     logger.failure('WORKER', context || 'Request failed', {}, error);
     if (!res.headersSent) {
       const statusCode = error instanceof AppError ? error.statusCode : 500;

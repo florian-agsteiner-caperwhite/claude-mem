@@ -1,25 +1,14 @@
-/**
- * Tests for MCP tool inputSchema declarations (fix for #1384 / #1413)
- *
- * Validates that search and timeline tools declare their parameters explicitly
- * so MCP clients (Claude Code) can expose them to the LLM.
- */
 import { describe, it, expect } from 'bun:test';
 
-// Static schema validation — reads source as text, no server startup needed
 const mcpServerPath = new URL('../../src/servers/mcp-server.ts', import.meta.url).pathname;
 
 describe('MCP tool inputSchema declarations', () => {
   let tools: any[];
 
-  // Load tools by reading the source and extracting the exported structure
-  // We test the schema shape directly from the source constants
   it('search tool declares query parameter', async () => {
     const src = await Bun.file(mcpServerPath).text();
 
-    // Verify search properties are declared (not empty)
     expect(src).toContain("name: 'search'");
-    // Check query is declared in properties after the search tool definition
     const searchSection = src.slice(src.indexOf("name: 'search'"), src.indexOf("name: 'timeline'"));
     expect(searchSection).toContain("query:");
     expect(searchSection).toContain("limit:");
@@ -49,5 +38,82 @@ describe('MCP tool inputSchema declarations', () => {
     const getObsSection = src.slice(src.indexOf("name: 'get_observations'"));
     expect(getObsSection).toContain("ids:");
     expect(getObsSection).toContain("required:");
+  });
+
+  // Phase 8 — observation_* tools backed by server-beta REST core.
+  it('observation_add tool declares content as required', async () => {
+    const src = await Bun.file(mcpServerPath).text();
+    const section = src.slice(
+      src.indexOf("name: 'observation_add'"),
+      src.indexOf("name: 'observation_record_event'"),
+    );
+    expect(section).toContain('content:');
+    expect(section).toContain("required: ['content']");
+    expect(section).toContain('handleObservationAdd');
+  });
+
+  it('observation_record_event declares eventType as required', async () => {
+    const src = await Bun.file(mcpServerPath).text();
+    const section = src.slice(
+      src.indexOf("name: 'observation_record_event'"),
+      src.indexOf("name: 'observation_search'"),
+    );
+    expect(section).toContain('eventType:');
+    expect(section).toContain("required: ['eventType']");
+    expect(section).toContain('handleObservationRecordEvent');
+  });
+
+  it('observation_search declares query as required and accepts limit', async () => {
+    const src = await Bun.file(mcpServerPath).text();
+    const section = src.slice(
+      src.indexOf("name: 'observation_search'"),
+      src.indexOf("name: 'observation_context'"),
+    );
+    expect(section).toContain('query:');
+    expect(section).toContain('limit:');
+    expect(section).toContain("required: ['query']");
+    expect(section).toContain('handleObservationSearch');
+  });
+
+  it('observation_context declares query as required and exposes a limit cap', async () => {
+    const src = await Bun.file(mcpServerPath).text();
+    const section = src.slice(
+      src.indexOf("name: 'observation_context'"),
+      src.indexOf("name: 'observation_generation_status'"),
+    );
+    expect(section).toContain("required: ['query']");
+    expect(section).toContain('handleObservationContext');
+  });
+
+  it('observation_generation_status declares jobId as required', async () => {
+    const src = await Bun.file(mcpServerPath).text();
+    const section = src.slice(src.indexOf("name: 'observation_generation_status'"));
+    expect(section).toContain('jobId:');
+    expect(section).toContain("required: ['jobId']");
+    expect(section).toContain('handleObservationGenerationStatus');
+  });
+
+  it('memory_* compatibility aliases delegate to observation handlers', async () => {
+    const src = await Bun.file(mcpServerPath).text();
+    // The aliases must keep the same handler functions as the canonical
+    // observation_* tools, otherwise we have two write paths in MCP.
+    const memoryAdd = src.slice(src.indexOf("name: 'memory_add'"), src.indexOf("name: 'memory_search'"));
+    expect(memoryAdd).toContain('handleObservationAdd');
+    const memorySearch = src.slice(src.indexOf("name: 'memory_search'"), src.indexOf("name: 'memory_context'"));
+    expect(memorySearch).toContain('handleObservationSearch');
+    const memoryContext = src.slice(src.indexOf("name: 'memory_context'"), src.indexOf("name: 'smart_search'"));
+    expect(memoryContext).toContain('handleObservationContext');
+  });
+
+  it('mcp-server skips worker auto-start when runtime=server-beta (anti-pattern guard)', async () => {
+    const src = await Bun.file(mcpServerPath).text();
+    expect(src).toContain("selectRuntime() === 'server-beta'");
+    expect(src).toContain('skipping worker auto-start');
+  });
+
+  it('mcp-server does NOT import WorkerService (anti-pattern guard, plan line 772)', async () => {
+    const src = await Bun.file(mcpServerPath).text();
+    expect(src).not.toMatch(/from\s+['"][^'"]*WorkerService[^'"]*['"]/);
+    expect(src).not.toMatch(/import\s+\{[^}]*WorkerService[^}]*\}/);
   });
 });

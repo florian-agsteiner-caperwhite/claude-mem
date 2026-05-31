@@ -1,33 +1,25 @@
 import { readJsonFromStdin } from './stdin-reader.js';
 import { getPlatformAdapter } from './adapters/index.js';
+import { AdapterRejectedInput } from './adapters/errors.js';
 import { getEventHandler } from './handlers/index.js';
 import { HOOK_EXIT_CODES } from '../shared/hook-constants.js';
+import {
+  installHookStderrBuffer,
+  emitModelContext,
+  emitBlockingError,
+  exitGraceful,
+  resetHookIoState,
+} from '../shared/hook-io.js';
 import { logger } from '../utils/logger.js';
 
 export interface HookCommandOptions {
-  /** If true, don't call process.exit() - let caller handle process lifecycle */
   skipExit?: boolean;
 }
 
-/**
- * Classify whether an error indicates the worker is unavailable (graceful degradation)
- * vs a handler/client bug (blocking error that developers need to see).
- *
- * Exit 0 (graceful degradation):
- * - Transport failures: ECONNREFUSED, ECONNRESET, EPIPE, ETIMEDOUT, fetch failed
- * - Timeout errors: timed out, timeout
- * - Server errors: HTTP 5xx status codes
- *
- * Exit 2 (blocking error — handler/client bug):
- * - HTTP 4xx status codes (bad request, not found, validation error)
- * - Programming errors (TypeError, ReferenceError, SyntaxError)
- * - All other unexpected errors
- */
 export function isWorkerUnavailableError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   const lower = message.toLowerCase();
 
-  // Transport failures — worker unreachable
   const transportPatterns = [
     'econnrefused',
     'econnreset',
@@ -43,70 +35,98 @@ export function isWorkerUnavailableError(error: unknown): boolean {
   ];
   if (transportPatterns.some(p => lower.includes(p))) return true;
 
-  // Timeout errors — worker didn't respond in time
   if (lower.includes('timed out') || lower.includes('timeout')) return true;
 
-  // HTTP 5xx server errors — worker has internal problems
   if (/failed:\s*5\d{2}/.test(message) || /status[:\s]+5\d{2}/.test(message)) return true;
 
-  // HTTP 429 (rate limit) — treat as transient unavailability, not a bug
   if (/failed:\s*429/.test(message) || /status[:\s]+429/.test(message)) return true;
 
-  // HTTP 4xx client errors — our bug, NOT worker unavailability
   if (/failed:\s*4\d{2}/.test(message) || /status[:\s]+4\d{2}/.test(message)) return false;
 
-  // Programming errors — code bugs, not worker unavailability
-  // Note: TypeError('fetch failed') already handled by transport patterns above
   if (error instanceof TypeError || error instanceof ReferenceError || error instanceof SyntaxError) {
     return false;
   }
 
-  // Default: treat unknown errors as blocking (conservative — surface bugs)
   return false;
 }
 
+export function isNonBlockingHookInputError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const lower = message.toLowerCase();
+
+  return lower.includes('transcript path') &&
+    (lower.includes('missing') || lower.includes('does not exist'));
+}
+
+async function executeHookPipeline(
+  adapter: ReturnType<typeof getPlatformAdapter>,
+  handler: ReturnType<typeof getEventHandler>,
+  platform: string,
+  options: HookCommandOptions
+): Promise<number> {
+  const rawInput = await readJsonFromStdin();
+  const input = adapter.normalizeInput(rawInput);
+  input.platform = platform;
+  const result = await handler.execute(input);
+
+  // MODEL_CONTEXT: the only stdout JSON emit, via the platform adapter.
+  emitModelContext(adapter, result);
+  const exitCode = result.exitCode ?? HOOK_EXIT_CODES.SUCCESS;
+  exitGraceful(options);
+  return exitCode;
+}
+
 export async function hookCommand(platform: string, event: string, options: HookCommandOptions = {}): Promise<number> {
-  // Suppress stderr in hook context — Claude Code shows stderr as error UI (#1181)
-  // Exit 1: stderr shown to user. Exit 2: stderr fed to Claude for processing.
-  // All diagnostics go to log file via logger; stderr must stay clean.
-  const originalStderrWrite = process.stderr.write.bind(process.stderr);
-  process.stderr.write = (() => true) as typeof process.stderr.write;
+  resetHookIoState();
+
+  // Hook IO Discipline (issue #2292):
+  // We BUFFER stderr during handler execution so that unsolicited writes from
+  // third-party libraries don't leak into model context. The buffer is FLUSHED
+  // only when we choose to surface (logger errors at the catch-all branch,
+  // fail-loud counter from worker-utils, blocking-error path). Successful exits
+  // drop the buffer — preserving the original "quiet on success" behavior.
+  //
+  // To bypass the buffer for a specific write, use emitDiagnostic /
+  // emitBlockingError from src/shared/hook-io.ts. Direct process.stderr.write
+  // calls are buffered.
+  const stderrBuffer = installHookStderrBuffer();
+
+  const adapter = getPlatformAdapter(platform);
+  const handler = getEventHandler(event);
 
   try {
-    const adapter = getPlatformAdapter(platform);
-    const handler = getEventHandler(event);
-
-    const rawInput = await readJsonFromStdin();
-    const input = adapter.normalizeInput(rawInput);
-    input.platform = platform;  // Inject platform for handler-level decisions
-    const result = await handler.execute(input);
-    const output = adapter.formatOutput(result);
-
-    console.log(JSON.stringify(output));
-    const exitCode = result.exitCode ?? HOOK_EXIT_CODES.SUCCESS;
-    if (!options.skipExit) {
-      process.exit(exitCode);
-    }
-    return exitCode;
+    return await executeHookPipeline(adapter, handler, platform, options);
   } catch (error) {
+    if (error instanceof AdapterRejectedInput) {
+      logger.warn('HOOK', `Adapter rejected input (${error.reason}), skipping hook`);
+      emitModelContext(adapter, { continue: true, suppressOutput: true });
+      exitGraceful(options);
+      return HOOK_EXIT_CODES.SUCCESS;
+    }
+    if (isNonBlockingHookInputError(error)) {
+      logger.warn('HOOK', `Hook input unavailable, skipping hook: ${error instanceof Error ? error.message : error}`);
+      emitModelContext(adapter, { continue: true, suppressOutput: true });
+      exitGraceful(options);
+      return HOOK_EXIT_CODES.SUCCESS;
+    }
     if (isWorkerUnavailableError(error)) {
-      // Worker unavailable — degrade gracefully, don't block the user
-      // Log to file instead of stderr (#1181)
       logger.warn('HOOK', `Worker unavailable, skipping hook: ${error instanceof Error ? error.message : error}`);
-      if (!options.skipExit) {
-        process.exit(HOOK_EXIT_CODES.SUCCESS);  // = 0 (graceful)
-      }
+      // EXIT_SIGNAL per CLAUDE.md: transient worker errors exit 0 to avoid
+      // Windows Terminal tab accumulation. The fail-loud counter (worker-utils
+      // recordWorkerUnreachable) handles the surface-after-N-failures path.
+      exitGraceful(options);
       return HOOK_EXIT_CODES.SUCCESS;
     }
 
-    // Handler/client bug — log to file instead of stderr (#1181)
     logger.error('HOOK', `Hook error: ${error instanceof Error ? error.message : error}`, {}, error instanceof Error ? error : undefined);
-    if (!options.skipExit) {
-      process.exit(HOOK_EXIT_CODES.BLOCKING_ERROR);  // = 2
-    }
+    // BLOCKING_FEEDBACK: flush the buffered logger.error line to stderr and
+    // exit 2 so the model receives it per Claude Code's hook contract.
+    emitBlockingError(
+      `Hook error: ${error instanceof Error ? error.message : String(error)}`,
+      options,
+    );
     return HOOK_EXIT_CODES.BLOCKING_ERROR;
   } finally {
-    // Restore stderr for non-hook code paths (e.g., when skipExit is true and process continues as worker)
-    process.stderr.write = originalStderrWrite;
+    stderrBuffer.restore();
   }
 }
