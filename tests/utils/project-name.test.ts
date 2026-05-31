@@ -1,11 +1,5 @@
-/**
- * Project Name Tests
- *
- * Tests tilde expansion and project name extraction.
- * Source: src/utils/project-name.ts
- */
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { homedir } from 'os';
 import { getProjectName, getProjectContext } from '../../src/utils/project-name.js';
 
@@ -60,6 +54,46 @@ describe('getProjectName', () => {
     });
   });
 
+  describe('#2663 — name derived from git repo root', () => {
+    let tmp: string;
+    let repoRoot: string;
+    let nestedDir: string;
+
+    beforeAll(async () => {
+      const { mkdtempSync, mkdirSync, realpathSync } = await import('fs');
+      const { execFileSync } = await import('child_process');
+      const { join } = await import('path');
+      const { tmpdir } = await import('os');
+
+      // macOS /tmp symlinks to /private/tmp; realpath so `git --show-toplevel`
+      // (which returns the canonical path) matches our expectations.
+      tmp = realpathSync(mkdtempSync(join(tmpdir(), 'cm-reporoot-')));
+      repoRoot = join(tmp, 'my-real-repo');
+      nestedDir = join(repoRoot, 'packages', 'deeply', 'nested');
+      mkdirSync(nestedDir, { recursive: true });
+      execFileSync('git', ['init', '-q'], { cwd: repoRoot });
+    });
+
+    afterAll(async () => {
+      const { rmSync } = await import('fs');
+      rmSync(tmp, { recursive: true, force: true });
+    });
+
+    it('deep subdirectory inside a repo yields the repo-root name', () => {
+      expect(getProjectName(nestedDir)).toBe('my-real-repo');
+    });
+
+    it('repo root itself yields the repo-root name', () => {
+      expect(getProjectName(repoRoot)).toBe('my-real-repo');
+    });
+
+    it('non-repo path falls back to basename(cwd)', () => {
+      // A path that does not exist (and therefore cannot be in a repo) must
+      // fall back to basename(cwd) rather than throwing or returning a root.
+      expect(getProjectName('/no/such/dir/standalone-folder')).toBe('standalone-folder');
+    });
+  });
+
   describe('realistic scenarios from #1478', () => {
     it('handles ~ the same as full home path', () => {
       const home = homedir();
@@ -95,5 +129,49 @@ describe('getProjectContext', () => {
     const ctx = getProjectContext(null);
     expect(ctx.primary).toBe('unknown-project');
     expect(ctx.parent).toBeNull();
+  });
+
+  describe('worktree isolation', () => {
+    let tmp: string;
+    let mainRepo: string;
+    let worktreeCheckout: string;
+
+    beforeAll(async () => {
+      const { mkdtempSync, mkdirSync, writeFileSync } = await import('fs');
+      const { join } = await import('path');
+      const { tmpdir } = await import('os');
+
+      tmp = mkdtempSync(join(tmpdir(), 'cm-wt-'));
+      mainRepo = join(tmp, 'main-repo');
+      const worktreeGitDir = join(mainRepo, '.git', 'worktrees', 'my-worktree');
+      worktreeCheckout = join(tmp, 'my-worktree');
+
+      mkdirSync(worktreeGitDir, { recursive: true });
+      mkdirSync(worktreeCheckout, { recursive: true });
+      writeFileSync(
+        join(worktreeCheckout, '.git'),
+        `gitdir: ${worktreeGitDir}\n`
+      );
+    });
+
+    afterAll(async () => {
+      const { rmSync } = await import('fs');
+      rmSync(tmp, { recursive: true, force: true });
+    });
+
+    it('uses parent/worktree composite as primary when in a worktree', () => {
+      const ctx = getProjectContext(worktreeCheckout);
+      expect(ctx.isWorktree).toBe(true);
+      expect(ctx.primary).toBe('main-repo/my-worktree');
+      expect(ctx.parent).toBe('main-repo');
+      expect(ctx.allProjects).toEqual(['main-repo', 'main-repo/my-worktree']);
+    });
+
+    it('write-path call sites resolve to composite name in worktrees', () => {
+      const project = getProjectContext(worktreeCheckout).primary;
+      expect(project).toBe('main-repo/my-worktree');
+      expect(project).not.toBe('main-repo');
+      expect(project).not.toBe('my-worktree');
+    });
   });
 });

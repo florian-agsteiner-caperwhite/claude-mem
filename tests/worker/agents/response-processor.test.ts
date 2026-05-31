@@ -1,8 +1,6 @@
 import { describe, it, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
 import { logger } from '../../../src/utils/logger.js';
 
-// Mock modules that cause import chain issues - MUST be before imports
-// Use full paths from test file location
 mock.module('../../../src/services/worker-service.js', () => ({
   updateCursorContextForProject: () => Promise.resolve(),
 }));
@@ -11,7 +9,6 @@ mock.module('../../../src/shared/worker-utils.js', () => ({
   getWorkerPort: () => 37777,
 }));
 
-// Mock the ModeManager
 mock.module('../../../src/services/domain/ModeManager.js', () => ({
   ModeManager: {
     getInstance: () => ({
@@ -29,18 +26,16 @@ mock.module('../../../src/services/domain/ModeManager.js', () => ({
   },
 }));
 
-// Import after mocks
 import { processAgentResponse } from '../../../src/services/worker/agents/ResponseProcessor.js';
+import { SUMMARY_MODE_MARKER } from '../../../src/sdk/prompts.js';
 import type { WorkerRef, StorageResult } from '../../../src/services/worker/agents/types.js';
 import type { ActiveSession } from '../../../src/services/worker-types.js';
 import type { DatabaseManager } from '../../../src/services/worker/DatabaseManager.js';
 import type { SessionManager } from '../../../src/services/worker/SessionManager.js';
 
-// Spy on logger methods to suppress output during tests
 let loggerSpies: ReturnType<typeof spyOn>[] = [];
 
 describe('ResponseProcessor', () => {
-  // Mocks
   let mockStoreObservations: ReturnType<typeof mock>;
   let mockChromaSyncObservation: ReturnType<typeof mock>;
   let mockChromaSyncSummary: ReturnType<typeof mock>;
@@ -51,7 +46,6 @@ describe('ResponseProcessor', () => {
   let mockWorker: WorkerRef;
 
   beforeEach(() => {
-    // Spy on logger to suppress output
     loggerSpies = [
       spyOn(logger, 'info').mockImplementation(() => {}),
       spyOn(logger, 'debug').mockImplementation(() => {}),
@@ -59,7 +53,6 @@ describe('ResponseProcessor', () => {
       spyOn(logger, 'error').mockImplementation(() => {}),
     ];
 
-    // Create fresh mocks for each test
     mockStoreObservations = mock(() => ({
       observationIds: [1, 2],
       summaryId: 1,
@@ -91,6 +84,8 @@ describe('ResponseProcessor', () => {
         cleanupProcessed: mock(() => 0),
         resetStuckMessages: mock(() => 0),
       }),
+      confirmClaimedMessages: mock(() => Promise.resolve(0)),
+      resetProcessingToPending: mock(() => Promise.resolve(0)),
     } as unknown as SessionManager;
 
     mockBroadcast = mock(() => {});
@@ -109,7 +104,6 @@ describe('ResponseProcessor', () => {
     mock.restore();
   });
 
-  // Helper to create mock session
   function createMockSession(
     overrides: Partial<ActiveSession> = {}
   ): ActiveSession {
@@ -127,11 +121,11 @@ describe('ResponseProcessor', () => {
       cumulativeInputTokens: 100,
       cumulativeOutputTokens: 50,
       earliestPendingTimestamp: Date.now() - 10000,
+      claimedMessageIds: [],
       conversationHistory: [],
       currentProvider: 'claude',
-      processingMessageIds: [],  // CLAIM-CONFIRM pattern: track message IDs being processed
       ...overrides,
-    };
+    } as ActiveSession;
   }
 
   describe('parsing observations from XML response', () => {
@@ -213,7 +207,14 @@ describe('ResponseProcessor', () => {
   });
 
   describe('non-XML observer responses', () => {
-    it('warns when the observer returns prose that will be discarded', async () => {
+    it('warns and clears pending work when the observer returns non-XML prose', async () => {
+      const confirmClaimedMessages = mock(() => Promise.resolve(0));
+      mockSessionManager = {
+        getMessageIterator: async function* () { yield* []; },
+        getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
+        confirmClaimedMessages,
+      } as unknown as SessionManager;
+
       const session = createMockSession();
       const responseText = 'Skipping — repeated log scan with no new findings.';
 
@@ -230,15 +231,12 @@ describe('ResponseProcessor', () => {
 
       expect(logger.warn).toHaveBeenCalledWith(
         'PARSER',
-        'TestAgent returned non-XML response; observation content was discarded',
-        expect.objectContaining({
-          sessionId: 1,
-          preview: responseText
-        })
+        expect.stringMatching(/^TestAgent returned non-XML prose response/),
+        expect.objectContaining({ sessionId: 1, outputClass: 'prose' })
       );
-      const [, , observations, summary] = mockStoreObservations.mock.calls[0];
-      expect(observations).toHaveLength(0);
-      expect(summary).toBeNull();
+      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
+      expect(session.earliestPendingTimestamp).toBeNull();
+      expect(mockStoreObservations).not.toHaveBeenCalled();
     });
   });
 
@@ -246,14 +244,6 @@ describe('ResponseProcessor', () => {
     it('should parse summary from response', async () => {
       const session = createMockSession();
       const responseText = `
-        <observation>
-          <type>discovery</type>
-          <title>Test</title>
-          <facts></facts>
-          <concepts></concepts>
-          <files_read></files_read>
-          <files_modified></files_modified>
-        </observation>
         <summary>
           <request>Build login form</request>
           <investigated>Reviewed existing forms</investigated>
@@ -295,7 +285,6 @@ describe('ResponseProcessor', () => {
         </observation>
       `;
 
-      // Mock to return result without summary
       mockStoreObservations = mock(() => ({
         observationIds: [1],
         summaryId: null,
@@ -319,9 +308,7 @@ describe('ResponseProcessor', () => {
       );
 
       const [, , , summary] = mockStoreObservations.mock.calls[0];
-      // #1718: When observations exist without <summary> tags, a synthetic summary is salvaged
-      expect(summary).not.toBeNull();
-      expect(summary.notes).toContain('Salvaged from');
+      expect(summary).toBeNull();
     });
   });
 
@@ -357,10 +344,8 @@ describe('ResponseProcessor', () => {
         'TestAgent'
       );
 
-      // Verify storeObservations was called exactly once (atomic)
       expect(mockStoreObservations).toHaveBeenCalledTimes(1);
 
-      // Verify all parameters passed correctly
       const [
         memorySessionId,
         project,
@@ -374,7 +359,7 @@ describe('ResponseProcessor', () => {
       expect(memorySessionId).toBe('memory-session-456');
       expect(project).toBe('test-project');
       expect(observations).toHaveLength(1);
-      expect(summary).not.toBeNull();
+      expect(summary).toBeNull();
       expect(promptNumber).toBe(5);
       expect(tokens).toBe(100);
       expect(timestamp).toBe(1700000000000);
@@ -397,7 +382,6 @@ describe('ResponseProcessor', () => {
         </observation>
       `;
 
-      // Mock returning single observation ID
       mockStoreObservations = mock(() => ({
         observationIds: [42],
         summaryId: null,
@@ -420,10 +404,8 @@ describe('ResponseProcessor', () => {
         'TestAgent'
       );
 
-      // Should broadcast observation
       expect(mockBroadcast).toHaveBeenCalled();
 
-      // Find the observation broadcast call
       const observationCall = mockBroadcast.mock.calls.find(
         (call: any[]) => call[0].type === 'new_observation'
       );
@@ -434,16 +416,19 @@ describe('ResponseProcessor', () => {
     });
 
     it('should broadcast summary via SSE', async () => {
+      mockStoreObservations = mock(() => ({
+        observationIds: [],
+        summaryId: 99,
+        createdAtEpoch: 1700000000000,
+      } as StorageResult));
+      (mockDbManager.getSessionStore as any) = () => ({
+        storeObservations: mockStoreObservations,
+        ensureMemorySessionIdRegistered: mock(() => {}),
+        getSessionById: mock(() => ({ memory_session_id: 'memory-session-456' })),
+      });
+
       const session = createMockSession();
       const responseText = `
-        <observation>
-          <type>discovery</type>
-          <title>Test</title>
-          <facts></facts>
-          <concepts></concepts>
-          <files_read></files_read>
-          <files_modified></files_modified>
-        </observation>
         <summary>
           <request>Build feature</request>
           <investigated>Reviewed code</investigated>
@@ -464,7 +449,6 @@ describe('ResponseProcessor', () => {
         'TestAgent'
       );
 
-      // Find the summary broadcast call
       const summaryCall = mockBroadcast.mock.calls.find(
         (call: any[]) => call[0].type === 'new_summary'
       );
@@ -473,70 +457,47 @@ describe('ResponseProcessor', () => {
     });
   });
 
-  describe('handling empty response', () => {
-    it('should handle empty response gracefully', async () => {
+  describe('handling empty / non-XML response', () => {
+    it('clears pending work and does NOT call storeObservations on empty response', async () => {
+      const confirmClaimedMessages = mock(() => Promise.resolve(0));
+      mockSessionManager = {
+        getMessageIterator: async function* () { yield* []; },
+        getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
+        confirmClaimedMessages,
+      } as unknown as SessionManager;
+
       const session = createMockSession();
       const responseText = '';
 
-      // Mock to handle empty observations
-      mockStoreObservations = mock(() => ({
-        observationIds: [],
-        summaryId: null,
-        createdAtEpoch: 1700000000000,
-      }));
-      (mockDbManager.getSessionStore as any) = () => ({
-        storeObservations: mockStoreObservations,
-        ensureMemorySessionIdRegistered: mock(() => {}),
-        getSessionById: mock(() => ({ memory_session_id: 'memory-session-456' })),
-      });
-
       await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
+        responseText, session, mockDbManager, mockSessionManager, mockWorker,
+        100, null, 'TestAgent'
       );
 
-      // Should still call storeObservations with empty arrays
-      expect(mockStoreObservations).toHaveBeenCalledTimes(1);
-      const [, , observations, summary] = mockStoreObservations.mock.calls[0];
-      expect(observations).toHaveLength(0);
-      expect(summary).toBeNull();
+      expect(mockStoreObservations).not.toHaveBeenCalled();
+      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
+      expect(session.earliestPendingTimestamp).toBeNull();
     });
 
-    it('should handle response with only text (no XML)', async () => {
+    it('clears pending work and does NOT call storeObservations on plain-text response', async () => {
+      const confirmClaimedMessages = mock(() => Promise.resolve(0));
+      mockSessionManager = {
+        getMessageIterator: async function* () { yield* []; },
+        getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
+        confirmClaimedMessages,
+      } as unknown as SessionManager;
+
       const session = createMockSession();
       const responseText = 'This is just plain text without any XML tags.';
 
-      mockStoreObservations = mock(() => ({
-        observationIds: [],
-        summaryId: null,
-        createdAtEpoch: 1700000000000,
-      }));
-      (mockDbManager.getSessionStore as any) = () => ({
-        storeObservations: mockStoreObservations,
-        ensureMemorySessionIdRegistered: mock(() => {}),
-        getSessionById: mock(() => ({ memory_session_id: 'memory-session-456' })),
-      });
-
       await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
+        responseText, session, mockDbManager, mockSessionManager, mockWorker,
+        100, null, 'TestAgent'
       );
 
-      expect(mockStoreObservations).toHaveBeenCalledTimes(1);
-      const [, , observations] = mockStoreObservations.mock.calls[0];
-      expect(observations).toHaveLength(0);
+      expect(mockStoreObservations).not.toHaveBeenCalled();
+      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
+      expect(session.earliestPendingTimestamp).toBeNull();
     });
   });
 
@@ -665,24 +626,34 @@ describe('ResponseProcessor', () => {
   });
 
   describe('error handling', () => {
-    it('should throw error if memorySessionId is missing from session', async () => {
+    it('should reset processing work if memorySessionId is missing from session', async () => {
+      const resetProcessingToPending = mock(() => Promise.resolve(1));
+      mockSessionManager = {
+        getMessageIterator: async function* () { yield* []; },
+        resetProcessingToPending,
+      } as unknown as SessionManager;
       const session = createMockSession({
         memorySessionId: null, // Missing memory session ID
       });
-      const responseText = '<observation><type>discovery</type></observation>';
+      const responseText = `<observation>
+        <type>discovery</type>
+        <title>some title</title>
+        <narrative>some narrative</narrative>
+      </observation>`;
 
-      await expect(
-        processAgentResponse(
-          responseText,
-          session,
-          mockDbManager,
-          mockSessionManager,
-          mockWorker,
-          100,
-          null,
-          'TestAgent'
-        )
-      ).rejects.toThrow('Cannot store observations: memorySessionId not yet captured');
+      await processAgentResponse(
+        responseText,
+        session,
+        mockDbManager,
+        mockSessionManager,
+        mockWorker,
+        100,
+        null,
+        'TestAgent'
+      );
+
+      expect(resetProcessingToPending).toHaveBeenCalledWith(1);
+      expect(mockStoreObservations).not.toHaveBeenCalled();
     });
   });
 
@@ -711,8 +682,6 @@ describe('ResponseProcessor', () => {
     });
 
     it('should set lastSummaryStored=false when storage returns summaryId=null (silent loss path, #1633)', async () => {
-      // Simulate the silent failure: agent returns no parseable <summary> tags,
-      // storeObservations skips summary and returns summaryId=null.
       mockStoreObservations.mockImplementation(() => ({
         observationIds: [],
         summaryId: null,
@@ -720,12 +689,105 @@ describe('ResponseProcessor', () => {
       } as StorageResult));
 
       const session = createMockSession();
-      // Response with no <summary> block — LLM failed to produce structured output
       const responseText = '<skip_summary/>';
 
       await processAgentResponse(responseText, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
 
       expect(session.lastSummaryStored).toBe(false);
+    });
+  });
+
+  describe.skip('circuit breaker: consecutiveSummaryFailures counter (#1633 — deleted)', () => {
+    const SUMMARY_PROMPT = `--- ${SUMMARY_MODE_MARKER} ---\nDo the summary now.`;
+
+    it('does NOT increment the counter on normal observation responses (P1 regression guard)', async () => {
+      mockStoreObservations.mockImplementation(() => ({
+        observationIds: [1],
+        summaryId: null,
+        createdAtEpoch: 1700000000000,
+      } as StorageResult));
+
+      const session = createMockSession({
+        conversationHistory: [{ role: 'user', content: 'record a new observation' }],
+      });
+      const obsResponse = `
+        <observation>
+          <type>discovery</type>
+          <title>found a thing</title>
+          <narrative>it happened</narrative>
+          <facts></facts>
+          <concepts></concepts>
+          <files_read></files_read>
+          <files_modified></files_modified>
+        </observation>
+      `;
+
+      for (let i = 0; i < 5; i++) {
+        await processAgentResponse(obsResponse, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
+      }
+
+      expect(session.consecutiveSummaryFailures).toBe(0);
+    });
+
+    it('increments the counter when a summary was expected but none was stored', async () => {
+      mockStoreObservations.mockImplementation(() => ({
+        observationIds: [],
+        summaryId: null,
+        createdAtEpoch: 1700000000000,
+      } as StorageResult));
+
+      const session = createMockSession({
+        conversationHistory: [{ role: 'user', content: SUMMARY_PROMPT }],
+      });
+      const badResponse = 'I cannot comply with that request.';
+
+      await processAgentResponse(badResponse, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
+
+      expect(session.consecutiveSummaryFailures).toBe(1);
+    });
+
+    it('does NOT increment the counter on intentional <skip_summary/> responses', async () => {
+      mockStoreObservations.mockImplementation(() => ({
+        observationIds: [],
+        summaryId: null,
+        createdAtEpoch: 1700000000000,
+      } as StorageResult));
+
+      const session = createMockSession({
+        consecutiveSummaryFailures: 1,
+        conversationHistory: [{ role: 'user', content: SUMMARY_PROMPT }],
+      });
+      const skipResponse = '<skip_summary reason="no meaningful work this session"/>';
+
+      await processAgentResponse(skipResponse, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
+
+      expect(session.consecutiveSummaryFailures).toBe(1);
+    });
+
+    it('resets the counter to 0 when a summary is successfully stored', async () => {
+      mockStoreObservations.mockImplementation(() => ({
+        observationIds: [],
+        summaryId: 42,
+        createdAtEpoch: 1700000000000,
+      } as StorageResult));
+
+      const session = createMockSession({
+        consecutiveSummaryFailures: 2,
+        conversationHistory: [{ role: 'user', content: SUMMARY_PROMPT }],
+      });
+      const goodResponse = `
+        <summary>
+          <request>wrap it up</request>
+          <investigated>the thing</investigated>
+          <learned>the answer</learned>
+          <completed>the work</completed>
+          <next_steps>none</next_steps>
+        </summary>
+      `;
+
+      await processAgentResponse(goodResponse, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
+
+      expect(session.consecutiveSummaryFailures).toBe(0);
     });
   });
 });

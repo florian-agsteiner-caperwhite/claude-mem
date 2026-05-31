@@ -1,30 +1,23 @@
-/**
- * Worker API Endpoints Integration Tests
- *
- * Tests all REST API endpoints with real HTTP and database.
- * Uses real Server instance with in-memory database.
- *
- * Sources:
- * - Server patterns from tests/server/server.test.ts
- * - Session routes from src/services/worker/http/routes/SessionRoutes.ts
- * - Search routes from src/services/worker/http/routes/SearchRoutes.ts
- */
 
-import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll, spyOn, mock } from 'bun:test';
 import { logger } from '../../src/utils/logger.js';
 
-// Mock middleware to avoid complex dependencies
+// Capture the real middleware module before mock.module mutates the live
+// namespace, then re-register the snapshot in afterAll. bun's mock.module is
+// process-global and mock.restore() does NOT undo it, so without this the stub
+// createMiddleware leaks into later files (e.g. CORS + v1-routes server tests).
+import * as realMiddleware from '../../src/services/worker/http/middleware.js';
+const realMiddlewareSnapshot = { ...realMiddleware };
+
 mock.module('../../src/services/worker/http/middleware.js', () => ({
   createMiddleware: () => [],
   requireLocalhost: (_req: any, _res: any, next: any) => next(),
   summarizeRequestBody: () => 'test body',
 }));
 
-// Import after mocks
 import { Server } from '../../src/services/server/Server.js';
 import type { ServerOptions } from '../../src/services/server/Server.js';
 
-// Suppress logger output during tests
 let loggerSpies: ReturnType<typeof spyOn>[] = [];
 
 describe('Worker API Endpoints Integration', () => {
@@ -69,6 +62,10 @@ describe('Worker API Endpoints Integration', () => {
     mock.restore();
   });
 
+  afterAll(() => {
+    mock.module('../../src/services/worker/http/middleware.js', () => realMiddlewareSnapshot);
+  });
+
   describe('Health/Readiness/Version Endpoints', () => {
     describe('GET /api/health', () => {
       it('should return status, initialized, mcpReady, platform, pid', async () => {
@@ -104,7 +101,7 @@ describe('Worker API Endpoints Integration', () => {
         const response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
         const body = await response.json();
 
-        expect(body.status).toBe('ok'); // Health always returns ok
+        expect(body.status).toBe('ok'); 
         expect(body.initialized).toBe(false);
         expect(body.mcpReady).toBe(false);
       });
@@ -205,7 +202,6 @@ describe('Worker API Endpoints Integration', () => {
         const response = await fetch(`http://127.0.0.1:${testPort}/api/health`, {
           method: 'OPTIONS'
         });
-        // OPTIONS should either return 200 or 204 (CORS preflight)
         expect([200, 204]).toContain(response.status);
       });
     });
@@ -223,7 +219,6 @@ describe('Worker API Endpoints Integration', () => {
         body: JSON.stringify({ key: 'value' })
       });
 
-      // Should get 404 (route not found), not a content-type error
       expect(response.status).toBe(404);
     });
 
@@ -253,14 +248,11 @@ describe('Worker API Endpoints Integration', () => {
       server = new Server(dynamicOptions);
       await server.listen(testPort, '127.0.0.1');
 
-      // Check uninitialized
       let response = await fetch(`http://127.0.0.1:${testPort}/api/readiness`);
       expect(response.status).toBe(503);
 
-      // Initialize
       initialized = true;
 
-      // Check initialized
       response = await fetch(`http://127.0.0.1:${testPort}/api/readiness`);
       expect(response.status).toBe(200);
     });
@@ -279,15 +271,12 @@ describe('Worker API Endpoints Integration', () => {
       server = new Server(dynamicOptions);
       await server.listen(testPort, '127.0.0.1');
 
-      // Check MCP not ready
       let response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
       let body = await response.json();
       expect(body.mcpReady).toBe(false);
 
-      // Set MCP ready
       mcpReady = true;
 
-      // Check MCP ready
       response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
       body = await response.json();
       expect(body.mcpReady).toBe(true);
@@ -308,18 +297,15 @@ describe('Worker API Endpoints Integration', () => {
       server = new Server(mockOptions);
       await server.listen(testPort, '127.0.0.1');
 
-      // Verify it's running
       const response = await fetch(`http://127.0.0.1:${testPort}/api/health`);
       expect(response.status).toBe(200);
 
-      // Close
       try {
         await server.close();
       } catch (e: any) {
         if (e.code !== 'ERR_SERVER_NOT_RUNNING') throw e;
       }
 
-      // Verify closed
       const httpServer = server.getHttpServer();
       if (httpServer) {
         expect(httpServer.listening).toBe(false);
@@ -332,10 +318,8 @@ describe('Worker API Endpoints Integration', () => {
 
       await server.listen(testPort, '127.0.0.1');
 
-      // Second server should fail on same port
       await expect(server2.listen(testPort, '127.0.0.1')).rejects.toThrow();
 
-      // Clean up second server if it has a reference
       const httpServer2 = server2.getHttpServer();
       if (httpServer2) {
         expect(httpServer2.listening).toBe(false);
@@ -346,23 +330,19 @@ describe('Worker API Endpoints Integration', () => {
       server = new Server(mockOptions);
       await server.listen(testPort, '127.0.0.1');
 
-      // Close first server
       try {
         await server.close();
       } catch (e: any) {
         if (e.code !== 'ERR_SERVER_NOT_RUNNING') throw e;
       }
 
-      // Wait for port to be released
       await new Promise(resolve => setTimeout(resolve, 100));
 
-      // Start second server on same port
       const server2 = new Server(mockOptions);
       await server2.listen(testPort, '127.0.0.1');
 
       expect(server2.getHttpServer()!.listening).toBe(true);
 
-      // Clean up
       try {
         await server2.close();
       } catch {
